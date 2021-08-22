@@ -1,5 +1,12 @@
-
+#include "HardwareSerial_NB_BC95.h"
 #include <Adafruit_MLX90614.h>
+
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <WiFiManager.h>
+#include <WiFiClientSecure.h>
+#include <TaskScheduler.h>
+#include <PubSubClient.h>
 
 #include <TFT_eSPI.h>
 #include <SPI.h>
@@ -16,28 +23,22 @@
 #include "lv4.h"
 #include "lv5.h"
 #include "lv6.h"
-//#include "BluetoothSerial.h"
 #include "Splash2.h"
 #include "NBIOT.h"
-#include "HardwareSerial_NB_BC95.h"
-#include <TFT_eSPI.h>
-//#include "FS.h"
 
-#include "RTClib.h"
 #include "Free_Fonts.h"
 #include "EEPROM.h"
 
-// Instantiate eeprom objects with parameter/argument names and sizes
-
 EEPROMClass  TVOCBASELINE("eeprom1", 0x200);
 EEPROMClass  eCO2BASELINE("eeprom2", 0x100);
-
 
 #define _TASK_SLEEP_ON_IDLE_RUN
 #define _TASK_PRIORITY
 #define _TASK_WDT_IDS
 #define _TASK_TIMECRITICAL
-#include <TaskScheduler.h>
+
+#define WIFI_AP ""
+#define WIFI_PASSWORD ""
 
 Scheduler runner;
 
@@ -64,10 +65,12 @@ int wtd = 0;
 int maxwtd = 10;
 
 int tftMax = 160;
-//BluetoothSerial SerialBT;
-Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+
+int countC = 0;
 
 String nccidStr = "";
+
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 
 int error;
 
@@ -77,33 +80,39 @@ String attr = "";
 
 HardwareSerial hwSerial(2);
 #define SERIAL1_RXPIN 25
-#define SERIAL1_TXPIN 17      // for thingcontrol board v1.7
-BME280I2C bme;    // Default : forced mode, standby time = 1000 ms
+#define SERIAL1_TXPIN 26
+BME280I2C bme;
 
+String deviceToken = "";
+String serverIP = "147.50.151.130"; // Your Server IP;
+String serverPort = "19956";
 
-
-String deviceToken = "20204205";
-String serverIP = "103.27.203.83"; // Your Server IP;
-String serverPort = "9956"; // Your Server Port;
+WiFiClientSecure wifiClient;
+PubSubClient client(wifiClient);
 
 HardwareSerial_NB_BC95 AISnb;
 
 float temp(NAN), hum(NAN), pres(NAN);
 
-Adafruit_SGP30 sgp;
-uint32_t getAbsoluteHumidity(float temperature, float humidity) {
-  // approximation formula from Sensirion SGP30 Driver Integration chapter 3.15
-  const float absoluteHumidity = 216.7f * ((humidity / 100.0f) * 6.112f * exp((17.62f * temperature) / (243.12f + temperature)) / (273.15f + temperature)); // [g/m^3]
-  const uint32_t absoluteHumidityScaled = static_cast<uint32_t>(1000.0f * absoluteHumidity); // [mg/m^3]
-  return absoluteHumidityScaled;
-}
+#include <TimeLib.h>
+#include <ArduinoJson.h>
+#include "time.h"
+#include <ArduinoOTA.h>
 
-// Update these with values suitable for your network.
+#define HOSTNAME "AIRMASS2.5"
+#define PASSWORD "12345678"
 
-#define tvoc_topic "sensor/tvoc"
-#define eco2_topic "sensor/eco2"
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600 * 7;
 
-
+int nbErrorTime = 0;
+bool connectWifi = false;
+StaticJsonDocument<400> doc;
+bool validEpoc = false;
+unsigned long time_s = 0;
+unsigned long _epoch = 0;
+struct tm timeinfo;
+WiFiManager wifiManager;
 //const boolean isCALIBRATESGP30 = false;
 
 String imsi = "";
@@ -116,11 +125,17 @@ TFT_eSprite stringPM1 = TFT_eSprite(&tft);
 TFT_eSprite stringPM10 = TFT_eSprite(&tft);
 TFT_eSprite stringCO2 = TFT_eSprite(&tft);
 TFT_eSprite stringVOC = TFT_eSprite(&tft);
+TFT_eSprite stringUpdate = TFT_eSprite(&tft);
 
 TFT_eSprite topNumber = TFT_eSprite(&tft);
 TFT_eSprite ind = TFT_eSprite(&tft);
 TFT_eSprite H = TFT_eSprite(&tft);
 TFT_eSprite T = TFT_eSprite(&tft);
+
+int status = WL_IDLE_STATUS;
+String downlink = "";
+char *bString;
+int PORT = 8883;
 
 struct pms7003data {
   uint16_t framelen;
@@ -131,7 +146,252 @@ struct pms7003data {
   uint16_t checksum;
 };
 
-// Callback methods prototypes
+char  char_to_byte(char c)
+{
+  if ((c >= '0') && (c <= '9'))
+  {
+    return (c - 0x30);
+  }
+  if ((c >= 'A') && (c <= 'F'))
+  {
+    return (c - 55);
+  }
+}
+
+void setupOTA()
+{
+  //Port defaults to 8266
+  //ArduinoOTA.setPort(8266);
+
+  //Hostname defaults to esp8266-[ChipID]
+  ArduinoOTA.setHostname(HOSTNAME);
+
+  //No authentication by default
+  ArduinoOTA.setPassword(PASSWORD);
+
+  //Password can be set with it's md5 value as well
+  //MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  //ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA.onStart([]()
+  {
+    Serial.println("Start Updating....");
+
+    Serial.printf("Start Updating....Type:%s\n", (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem");
+  });
+
+  ArduinoOTA.onEnd([]()
+  {
+
+    Serial.println("Update Complete!");
+
+    ESP.restart();
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+  {
+    String pro = String(progress / (total / 100)) + "%";
+    int progressbar = (progress / (total / 100));
+    //int progressbar = (progress / 5) % 100;
+    //int pro = progress / (total / 100);
+
+    drawUpdate(progressbar, 170, 10);
+    //tft.drawString("Updating", 280, 50, GFXFF); // Print the test text in the custom font
+
+
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error)
+  {
+    Serial.printf("Error[%u]: ", error);
+    String info = "Error Info:";
+    switch (error)
+    {
+      case OTA_AUTH_ERROR:
+        info += "Auth Failed";
+        Serial.println("Auth Failed");
+        break;
+
+      case OTA_BEGIN_ERROR:
+        info += "Begin Failed";
+        Serial.println("Begin Failed");
+        break;
+
+      case OTA_CONNECT_ERROR:
+        info += "Connect Failed";
+        Serial.println("Connect Failed");
+        break;
+
+      case OTA_RECEIVE_ERROR:
+        info += "Receive Failed";
+        Serial.println("Receive Failed");
+        break;
+
+      case OTA_END_ERROR:
+        info += "End Failed";
+        Serial.println("End Failed");
+        break;
+    }
+
+
+    Serial.println(info);
+    ESP.restart();
+  });
+
+  ArduinoOTA.begin();
+}
+
+void setupWIFI()
+{
+  WiFi.setHostname(HOSTNAME);
+
+  //等待5000ms，如果没有连接上，就继续往下
+  //不然基本功能不可用
+  byte count = 0;
+  while (WiFi.status() != WL_CONNECTED && count < 10)
+  {
+    count ++;
+    delay(500);
+    Serial.print(".");
+  }
+
+
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("Connecting...OK.");
+  else
+    Serial.println("Connecting...Failed");
+
+}
+
+void writeString(char add, String data)
+{
+  int _size = data.length();
+  int i;
+  for (i = 0; i < _size; i++)
+  {
+    EEPROM.write(add + i, data[i]);
+  }
+  EEPROM.write(add + _size, '\0'); //Add termination null character for String Data
+  EEPROM.commit();
+}
+
+void _writeEEPROM(String data) {
+  //Serial.print("Writing Data:");
+  //Serial.println(data);
+  writeString(10, data);  //Address 10 and String type data
+  delay(10);
+}
+
+String read_String(char add)
+{
+  int i;
+  char data[100]; //Max 100 Bytes
+  int len = 0;
+  unsigned char k;
+  k = EEPROM.read(add);
+  while (k != '\0' && len < 500) //Read until null character
+  {
+    k = EEPROM.read(add + len);
+    data[len] = k;
+    len++;
+  }
+  data[len] = '\0';
+
+  return String(data);
+}
+
+void getIP(String IP, String Port, String Data) {
+  json = "";
+  do {
+//    if (AISnb.pingIP(serverIP).status == false) {
+//      ESP.restart();
+//    }
+    UDPSend udp = AISnb.sendUDPmsgStr(IP, Port, Data);
+
+    //String nccid = AISnb.getNCCID();
+    //Serial.print("nccid:");
+    //Serial.println(nccid);
+
+    UDPReceive resp = AISnb.waitResponse();
+    AISnb.receive_UDP(resp);
+    Serial.print("waitData:");
+    Serial.println(resp.data);
+    if (udp.status == false) {
+      connectWifi = true;
+      break;
+    } else {
+      for (int x = 0; x < resp.data.length(); x += 2) {
+        char c = char_to_byte(resp.data[x]) << 4 | char_to_byte(resp.data[x + 1]);
+
+        json += c;
+      }
+      //Serial.println(json);
+      DeserializationError error = deserializeJson(doc, json);
+
+      // Test if parsing succeeds.
+      if (error) {
+        //Serial.print(F("deserializeJson() failed: "));
+        //Serial.println(error.f_str());
+        validEpoc = true;
+        delay(1000);
+      } else {
+        validEpoc = false;
+        time_s = millis();
+        _epoch = doc["epoch"];
+        String ip = doc["ip"];
+        if (ip != "null") {
+          serverIP = ip;
+          _writeEEPROM(serverIP);
+          if (EEPROM.commit()) {
+            Serial.println("EEPROM successfully committed");
+          }
+          Serial.print("Server IP : ");
+          Serial.println(serverIP);
+        }
+        //SerialBT.println(json);
+        Serial.println(json);
+        //Serial.print("epoch:");
+        //Serial.println(_epoch);
+      }
+    }
+    //
+  } while (validEpoc);
+}
+
+Adafruit_SGP30 sgp;
+uint32_t getAbsoluteHumidity(float temperature, float humidity) {
+  // approximation formula from Sensirion SGP30 Driver Integration chapter 3.15
+  const float absoluteHumidity = 216.7f * ((humidity / 100.0f) * 6.112f * exp((17.62f * temperature) / (243.12f + temperature)) / (273.15f + temperature)); // [g/m^3]
+  const uint32_t absoluteHumidityScaled = static_cast<uint32_t>(1000.0f * absoluteHumidity); // [mg/m^3]
+  return absoluteHumidityScaled;
+}
+
+#define tvoc_topic "sensor/tvoc"
+#define eco2_topic "sensor/eco2"
+
+Task t6(3600000, TASK_FOREVER, &t6CheckTime);
+void t6CheckTime() {
+  //Serial.println("Check Time");
+  if (connectWifi == false) {
+    if (_epoch != 0 && (millis() - time_s) > 300000 && hour(_epoch + ((millis() - time_s) / 1000) + (7 * 3600)) == 0) {
+      //Serial.println("Restart");
+      ESP.restart();
+    }
+  } else {
+    if (!getLocalTime(&timeinfo)) {
+      //Serial.println("Failed to obtain time");
+      return;
+    }
+    Serial.print("timeinfo.tm_hour:"); Serial.println(timeinfo.tm_hour);
+    Serial.print("timeinfo.tm_min:"); Serial.println(timeinfo.tm_min);
+    if (( timeinfo.tm_hour == 0) && ( timeinfo.tm_min < 10) ) {
+      Serial.println("Restart @ midnight2");
+      ESP.restart();
+    }
+  }
+}
+
 void tCallback();
 void t1CallGetProbe();
 void t2CallShowEnv();
@@ -140,16 +400,16 @@ void t4CallPrintPMS7003();
 void t5CallSendAttribute();
  // Tasks
 Task t1(2000, TASK_FOREVER, &t1CallGetProbe);  //adding task to the chain on creation
-Task t2(2000, TASK_FOREVER, &t2CallShowEnv);
-Task t3(300000, TASK_FOREVER, &t3CallSendData);
+Task t2(6000, TASK_FOREVER, &t2CallShowEnv);
+Task t3(60000, TASK_FOREVER, &t3CallSendData);
 
 Task t4(20000, TASK_FOREVER, &t4CallPrintPMS7003);  //adding task to the chain on creation
 Task t5(3600000, TASK_FOREVER, &t5CallSendAttribute);  //adding task to the chain on creation
+Task t7(1000, TASK_FOREVER, &t7showTime);
 
- 
 void tCallback() {
-  Scheduler &s = Scheduler::currentScheduler();
-  Task &t = s.currentTask();
+  //Scheduler &s = Scheduler::currentScheduler();
+  //Task &t = s.currentTask();
 
   //  Serial.print("Task: "); Serial.print(t.getId()); Serial.print(":\t");
   //  Serial.print(millis()); Serial.print("\tStart delay = "); Serial.println(t.getStartDelay());
@@ -161,10 +421,21 @@ void tCallback() {
     Serial.println("t1CallgetProbe: enabled t2CallshowEnv and added to the chain");
   }
 
-
 }
 struct pms7003data data;
-
+uint16_t pm01_env = 0;
+uint16_t pm25_env = 0;
+uint16_t pm100_env = 0;
+uint16_t TVOC = 0;
+uint16_t eCO2 = 0;
+float temp2 = 0;
+float hum2 = 0;
+void configModeCallback (WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  Serial.println(WiFi.softAPIP());
+  //if you used auto generated SSID, print it
+  Serial.println(myWiFiManager->getConfigPortalSSID());
+}
 void calibrate() {
   uint16_t readTvoc = 0;
   uint16_t readCo2 = 0;
@@ -242,24 +513,81 @@ void initBaseLine() {
 
 }
 
+void errorTimeDisplay(int i) {
+  tft.fillScreen(TFT_WHITE);
+  int xpos = tft.width() / 2; // Half the screen width
+  int ypos = tft.height() / 2;
+  tft.drawString("Connect NB failed " + String(i + 1) + " times", xpos, ypos, GFXFF);
+}
+
 void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(512);
   _initLCD();
   initBaseLine();
 
   delay(500);
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
   pinMode(32, OUTPUT); // on BME280
   digitalWrite(32, HIGH); // on BME280
   pinMode(33, OUTPUT); // turn on PMS7003
   digitalWrite(33, HIGH); // turn on PMS7003
   delay(500);
+  
+  deviceToken = AISnb.getNCCID();
 
-  Serial.begin(115200);
-  //    SerialBT.begin(deviceToken); //Bluetooth device name
-  String ip1 = AISnb.getDeviceIP();
+  if (EEPROM.read(10) == 255 ) {
+    _writeEEPROM("147.50.151.130");
+  }
+  serverIP = read_String(10);
+  while (nbErrorTime < 10) {
+    meta = AISnb.getSignal();
+    Serial.print("meta.rssi:"); Serial.println(meta.rssi);
+    if (!meta.rssi.equals("N/A")) {
+      if (meta.rssi.toInt() > -100) {
+        break;
+      } else {
+        errorTimeDisplay(nbErrorTime);
+        nbErrorTime++;
+        delay(1000);
+      }
+    } else {
+      errorTimeDisplay(nbErrorTime);
+      nbErrorTime++;
+      delay(1000);
+    }
+  }
+  
+  tft.fillScreen(TFT_WHITE);
+  tft.drawString("Wait for WiFi Setting (Timeout 60 Sec)", tft.width() / 2, tft.height() / 2, GFXFF);
+  wifiManager.setTimeout(60);
 
-  //
-  pingRESP pingR = AISnb.pingIP(serverIP);
-  //  previousMillis = millis();
+  wifiManager.setAPCallback(configModeCallback);
+  String wifiName = "AIRMASS2.5-";
+  wifiName.concat(String((uint32_t)ESP.getEfuseMac(), HEX));
+  if (!wifiManager.autoConnect(wifiName.c_str())) {
+    //Serial.println("failed to connect and hit timeout");
+    //reset and try again, or maybe put it to deep sleep
+    //    ESP.reset();
+    //delay(1000);
+  }
+  if (nbErrorTime == 10) {
+    connectWifi = true;
+  }
+  if (connectWifi == false) {
+    json = "{\"_type\":\"retrattr\",\"Tn\":\"";
+    json.concat(deviceToken);
+    json.concat("\",\"keys\":[\"epoch\",\"ip\"]}");
+    getIP(serverIP, serverPort, json);
+  }
+  if (connectWifi == true) {
+    configTime(gmtOffset_sec, 0, ntpServer);
+    client.setServer( "mqtt.thingcontrol.io", PORT );
+  }
+
+  setupWIFI();
+  setupOTA();
 
   hwSerial.begin(9600, SERIAL_8N1, SERIAL1_RXPIN, SERIAL1_TXPIN);
   _initBME280();
@@ -278,6 +606,8 @@ void setup() {
   //  Serial.println("added t4");
   runner.addTask(t5);
   //  Serial.println("added t5");
+  runner.addTask(t6);
+  runner.addTask(t7);
   
 
   delay(2000);
@@ -290,6 +620,8 @@ void setup() {
   //  Serial.println("Enabled t3");
   t4.enable();
   t5.enable();
+  t6.enable();
+  t7.enable();
    
   for (int i = 0; i < 1000; i++);
   tft.fillScreen(TFT_BLACK);            // Clear screen
@@ -300,7 +632,6 @@ void setup() {
   tft.fillRect(219, 185, tft.width() - 15, 5, TFT_PURPLE); // Print the test text in the custom font
   tft.fillRect(272, 185, tft.width() - 15, 5, TFT_BURGUNDY); // Print the test text in the custom font
   //  Serial.println("Scheduler Priority Test");
-
 
 }
 
@@ -374,7 +705,8 @@ void printBME280Data()
   BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
   BME280::PresUnit presUnit(BME280::PresUnit_Pa);
   bme.read(pres, temp, hum, tempUnit, presUnit);
-
+  hum2 += hum;
+  temp2 += temp;
 }
 
 void composeJson() {
@@ -413,15 +745,18 @@ void composeJson() {
   json.concat(sgp.TVOC);
 
   json.concat(",\"rssi\":");
-  json.concat(meta.rssi);
+  if (connectWifi == false) {
+    json.concat(meta.rssi);
+  } else {
+    json.concat(WiFi.RSSI());
+  }
   json.concat("}");
   Serial.println(json);
-  Serial.println(nccidStr);
+  //SerialBT.println(json);
   if (data.pm25_env > 1000)
     ESP.restart();
 
 }
-
 
 void t4CallPrintPMS7003() {
 
@@ -448,9 +783,9 @@ void t4CallPrintPMS7003() {
 
 }
 
-
-
 void t2CallShowEnv() {
+  Serial.print("Count : ");
+  Serial.println(countC);
   //  Serial.print(F("ready2display:"));
   //  Serial.println(ready2display);
   if (ready2display) {
@@ -468,8 +803,8 @@ void t2CallShowEnv() {
     //  for testing
     //        data.pm25_env = testNum;    //for testing
     //        testNum++;
-    drawNumberParticules();
-    drawPM2_5(data.pm25_env, mid, 50);
+    //drawNumberParticules();
+    drawPM2_5((pm25_env / countC), mid, 50);
 
     tft.setTextSize(1);
     tft.setFreeFont(CF_OL32);                 // Select the font
@@ -480,28 +815,35 @@ void t2CallShowEnv() {
 
     tft.setFreeFont(FSB9);   // Select Free Serif 9 point font, could use:
 
-    drawPM1(data.pm01_env, 6, 195);
+    drawPM1((pm01_env / countC), 6, 195);
     tft.drawString(title2, 40, 235, GFXFF); // Print the test text in the custom font
 
-    drawPM10(data.pm100_env, 65, 195);
+    drawPM10((pm100_env / countC), 65, 195);
     tft.drawString(title3, 110, 235, GFXFF); // Print the test text in the custom font
 
-    drawCO2(sgp.eCO2, 130, 195);
+    drawCO2((eCO2 / countC), 130, 195);
     tft.drawString(title4, 160, 235, GFXFF); // Print the test text in the custom font
 
-    drawVOC(sgp.TVOC, 185, 195);
+    drawVOC((TVOC / countC), 185, 195);
     tft.drawString(title5, 225, 235, GFXFF); // Print the test text in the custom font
 
-    tft.drawString("rH ", xpos + 115, 214, GFXFF); // Print the test text in the custom font
-    drawH(hum, xpos + 121, 195);
+    tft.drawString("RH ", xpos + 115, 214, GFXFF); // Print the test text in the custom font
+    drawH((hum2 / countC), xpos + 121, 195);
     tft.drawString("%", xpos + 154, 214, GFXFF);
 
     tft.drawString("T ", xpos + 115, 235, GFXFF); // Print the test text in the custom font
-    drawT(temp, xpos + 121, 214);
+    drawT((temp2 / countC), xpos + 121, 214);
     tft.drawString("C", xpos + 153, 235, GFXFF);
 
     //Clear Stage
-
+    pm01_env = 0;
+    pm25_env = 0;
+    pm100_env = 0;
+    countC = 0;
+    TVOC = 0;
+    eCO2 = 0;
+    temp2 = 0;
+    hum2 = 0;
     ind.createSprite(320, 10);
     ind.fillSprite(TFT_BLACK);
     if ((data.pm25_env >= 0) && (data.pm25_env <= 15.4)) {
@@ -546,10 +888,7 @@ void drawNumberParticules() {
 
   topNumber.pushSprite(5, 5);
   topNumber.deleteSprite();
-
-
 }
-
 
 boolean readPMSdata(Stream *s) {
   //  Serial.println("readPMSdata");
@@ -579,18 +918,58 @@ boolean readPMSdata(Stream *s) {
     buffer_u16[i] = buffer[2 + i * 2 + 1];
     buffer_u16[i] += (buffer[2 + i * 2] << 8);
   }
-
+  
   memcpy((void *)&data, (void *)buffer_u16, 30);
   // get checksum ready
   for (uint8_t i = 0; i < 30; i++) {
     sum += buffer[i];
   }
+  pm01_env += data.pm01_env;
+  pm25_env += data.pm25_env;
+  pm100_env += data.pm100_env;
   if (sum != data.checksum) {
     Serial.println("Checksum failure");
     return false;
   }
   // success!
   return true;
+}
+
+String a0(int n) {
+  return (n < 10) ? "0" + String(n) : String(n);
+}
+
+void t7showTime() {
+
+  topNumber.createSprite(200, 40);
+  //  stringPM1.fillSprite(TFT_GREEN);
+  topNumber.setFreeFont(FS9);
+  topNumber.setTextColor(TFT_WHITE);
+  topNumber.setTextSize(1);           // Font size scaling is x1
+
+  //topNumber.drawString(">1.0um", 0, 21, GFXFF); // Print the test text in the custom font
+  //topNumber.drawNumber(data.particles_10um, 10, 0);   //tft.drawString("0.1L air", 155, 5, GFXFF);
+  //topNumber.drawString(">2.5um", 95, 21, GFXFF); // Print the test text in the custom font
+  //topNumber.drawNumber(data.particles_25um, 105, 0);   //tft.drawString("0.1L air", 155, 5, GFXFF);
+  //topNumber.drawString(">5.0um", 180, 21, GFXFF); // Print the test text in the custom font
+  //topNumber.drawNumber(data.particles_50um, 192, 0);   //tft.drawString("0.1L air", 155, 5, GFXFF);
+  unsigned long NowTime = _epoch + ((millis() - time_s) / 1000) + (7 * 3600);
+  String timeS = "";
+  if (connectWifi == false) {
+    timeS = a0(day(NowTime)) + "/" + a0(month(NowTime)) + "/" + String(year(NowTime)) + "  [" + a0(hour(NowTime)) + ":" + a0(minute(NowTime)) + "]";
+  } else {
+    if (!getLocalTime(&timeinfo)) {
+      //Serial.println("Failed to obtain time");
+      return;
+    }
+    timeS = a0(timeinfo.tm_mday) + "/" + a0(timeinfo.tm_mon+1) + "/" + String(timeinfo.tm_year + 1900) + "  [" + a0(timeinfo.tm_hour) + ":" + a0(timeinfo.tm_min) + "]";
+  }
+  topNumber.drawString(timeS, 5, 10, GFXFF);
+  //Serial.println(timeS);
+  topNumber.pushSprite(5, 5);
+  topNumber.deleteSprite();
+
+
 }
 
 void t5CallSendAttribute() {
@@ -605,11 +984,8 @@ void t5CallSendAttribute() {
   attr.concat(NCCID);
   attr.concat("\"}");
   UDPSend udp = AISnb.sendUDPmsgStr(serverIP, serverPort, attr);
-
 }
-//void t6Restart() {
-//  ESP.restart();
-//}
+
 void t1CallGetProbe() {
   tCallback();
   boolean pmsReady = readPMSdata(&hwSerial);
@@ -628,6 +1004,20 @@ void t1CallGetProbe() {
 
   printBME280Data();
   getDataSGP30();
+  countC += 1;
+}
+
+void drawUpdate(int num, int x, int y)
+{
+  stringUpdate.createSprite(60, 20);
+  stringUpdate.fillScreen(TFT_BLACK);
+  stringUpdate.setFreeFont(FSB9);
+  stringUpdate.setTextColor(TFT_ORANGE);
+  stringUpdate.setTextSize(1);
+  stringUpdate.drawNumber(num, 0, 3);
+  stringUpdate.drawString("%", 25, 3, GFXFF);
+  stringUpdate.pushSprite(x, y);
+  stringUpdate.deleteSprite();
 }
 
 void drawPM2_5(int num, int x, int y)
@@ -741,7 +1131,8 @@ void getDataSGP30 () {
   }
   Serial.print("TVOC "); Serial.print(sgp.TVOC); Serial.print(" ppb\t");
   Serial.print("eCO2 "); Serial.print(sgp.eCO2); Serial.println(" ppm");
-
+  TVOC += sgp.TVOC;
+  eCO2 += sgp.eCO2;
 
   if (! sgp.IAQmeasureRaw()) {
     Serial.println("Raw Measurement failed");
@@ -766,22 +1157,49 @@ void getDataSGP30 () {
   Serial.print("****Get Baseline values: eCO2: 0x"); Serial.print(eCO2_base, HEX);
   Serial.print(" & TVOC: 0x"); Serial.println(TVOC_base, HEX);
 
-
-
 }
 
 void t3CallSendData() {
-  composeJson();
-  tft.pushImage(285, 0, nbiotWidth, nbiotHeight, nbiot);
-
-  UDPSend udp = AISnb.sendUDPmsgStr(serverIP, serverPort, json);
+  digitalWrite(12, HIGH);
   delay(2000);
-  tft.fillRect(285, 0, nbiotWidth, nbiotHeight, TFT_BLACK); // Print the test text in the custom font
+  digitalWrite(12, LOW);
+  composeJson();
 
-  UDPReceive resp = AISnb.waitResponse();
-  Serial.println("data is delivered");
-  //  gotosleep();
+  tft.setTextColor(0xFFFF);
+  int mapX = 315;
+  int mapY = 30;
+  Serial.println(WL_CONNECTED); Serial.print("(WiFi.status():"); Serial.println(WiFi.status());
+  if (connectWifi == false) {
+    // if (AISnb.pingIP(serverIP).status == false) {
+    //  ESP.restart();
+    // }
+    int rssi = map(meta.rssi.toInt(), -110, -50, 25, 100);
+    if (rssi > 100) rssi = 100;
+    if (rssi < 0) rssi = 0;
+    tft.fillRect(275, 5, 45, 35, 0x0000);
+    tft.drawString(String(rssi)  + "%", mapX, mapY, GFXFF);
+    tft.pushImage(240, 0, nbiotWidth, nbiotHeight, nbiot);
+    UDPSend udp = AISnb.sendUDPmsgStr(serverIP, serverPort, json);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    int rssi = map(WiFi.RSSI(), -90, -50, 25, 100);
+    if (rssi > 100) rssi = 100;
+    if (rssi < 0) rssi = 0;
+    tft.fillRect(275, 5, 45, 35, 0x0000);
+    tft.drawString(String(rssi) + "%", mapX, mapY, GFXFF);
+    tft.fillCircle(256, 16, 16, 0x9E4A);
+    tft.setTextColor(0x0000);
+    tft.setFreeFont(FSSB9);
+    tft.drawString("W", 265, 27);
+    //client.setInsecure();
+    Serial.print(" deviceToken.c_str()"); Serial.println(deviceToken.c_str());
+    if (client.connect("DustBoy", deviceToken.c_str(), NULL)) {
+      Serial.println("******************************************************8Connected!");
+      Serial.println(json.c_str());
+      client.publish("v1/devices/me/telemetry", json.c_str());
+    }
+  }
 }
 void loop() {
+  ArduinoOTA.handle();
   runner.execute();
 }
